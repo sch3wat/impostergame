@@ -389,14 +389,15 @@
 
         const RulesModal = ({ onClose }) => (
             <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
-                <div className="bg-gray-800 rounded-2xl p-6 max-w-sm w-full border border-purple-500/30 shadow-2xl">
+                <div className="bg-gray-800 rounded-2xl p-6 max-w-sm w-full border border-purple-500/30 shadow-2xl max-h-[80vh] overflow-y-auto">
                     <h2 className="text-2xl font-bold mb-4 text-purple-400">📜 Правила игры</h2>
                     <ul className="space-y-3 text-gray-300 text-sm list-disc pl-5">
-                        <li><strong>Роли:</strong> Есть Мирные и один Шпион.</li>
+                        <li><strong>Роли:</strong> Есть Мирные и Шпион(ы).</li>
                         <li><strong>Мирные:</strong> Знают слово. Задача — вычислить Шпиона вопросами.</li>
                         <li><strong>Шпион:</strong> Видит "СКРЫТО". Задача — понять слово или выжить.</li>
                         <li><strong>Победа Шпиона:</strong> Если Шпион догадался, какое слово загадано, он может нажать кнопку "Я знаю слово" и победить сразу! <br/><span className="text-yellow-400">Допускается 1 опечатка в слове!</span></li>
                         <li><strong>Ставки:</strong> Ставьте на тех, кого подозреваете, чтобы давить на них.</li>
+                        <li className="text-red-400"><strong>🕵️🕵️ Режим 2 шпиона:</strong> Для больших компаний! Шпионы знают друг друга и работают в команде. Мирные победят только когда выгонят ВСЕХ шпионов!</li>
                     </ul>
                     <button onClick={onClose} className="mt-6 w-full bg-purple-600 hover:bg-purple-700 py-3 rounded-xl font-bold tap-animation text-white">Понятно!</button>
                 </div>
@@ -449,6 +450,7 @@
             const [gameState, setGameState] = useState({});
             const [selectedTheme, setSelectedTheme] = useState('Животные 🐻'); // Default theme updated
             const [difficulty, setDifficulty] = useState('mix'); 
+            const [spyCount, setSpyCount] = useState(1); // Количество шпионов
             const [voteTarget, setVoteTarget] = useState(null);
             const [countdown, setCountdown] = useState(10);
             
@@ -549,16 +551,33 @@
             const startGameSetup = async () => {
                 if (!selectedTheme) return alert('Выберите тему');
                 if (players.length < 2) return alert('Нужно минимум 2 игрока!');
+                if (spyCount >= players.length) return alert('Шпионов должно быть меньше, чем игроков!');
                 try {
                     const themeData = GAME_DATABASE[selectedTheme];
                     let wordsPool = difficulty === 'mix' ? [...themeData.easy, ...themeData.medium, ...themeData.hard] : (themeData[difficulty] || themeData.easy);
                     const word = wordsPool[Math.floor(Math.random() * wordsPool.length)];
-                    const impId = players[Math.floor(Math.random() * players.length)].id;
+                    
+                    // Выбираем несколько шпионов
+                    const shuffledPlayers = [...players].sort(() => Math.random() - 0.5);
+                    const impostorIds = shuffledPlayers.slice(0, spyCount).map(p => p.id);
+                    
                     const gamePlayers = {};
-                    players.forEach(p => gamePlayers[p.id] = { role: p.id === impId ? 'impostor' : 'civilian', isDead: false });
+                    players.forEach(p => gamePlayers[p.id] = { 
+                        role: impostorIds.includes(p.id) ? 'impostor' : 'civilian', 
+                        isDead: false 
+                    });
                     
                     await database.ref(`rooms/${roomCode}/game`).set({
-                        phase: 'WORD_SELECT', theme: selectedTheme, difficulty: difficulty, currentWord: word, impostorId: impId, players: gamePlayers, bets: {}, votes: null
+                        phase: 'WORD_SELECT', 
+                        theme: selectedTheme, 
+                        difficulty: difficulty, 
+                        currentWord: word, 
+                        impostorIds: impostorIds, // Массив ID шпионов
+                        impostorId: impostorIds[0], // Для совместимости
+                        spyCount: spyCount,
+                        players: gamePlayers, 
+                        bets: {}, 
+                        votes: null
                     });
                 } catch (error) { alert("Ошибка запуска: " + error.message); }
             };
@@ -614,12 +633,33 @@
                 if (candidate) {
                     const victimRole = gamePlayers[candidate].role;
                     if (victimRole === 'impostor') {
-                        await database.ref(`rooms/${roomCode}/game`).update({ phase: 'GAME_OVER', winner: 'civilians', ejected: candidate });
+                        // Проверяем, остались ли еще живые шпионы
+                        await database.ref(`rooms/${roomCode}/game/players/${candidate}`).update({ isDead: true });
+                        
+                        const updatedPlayers = { ...gamePlayers, [candidate]: { ...gamePlayers[candidate], isDead: true } };
+                        const aliveImpostors = Object.values(updatedPlayers).filter(p => p.role === 'impostor' && !p.isDead).length;
+                        
+                        if (aliveImpostors === 0) {
+                            // Все шпионы выбыли - мирные победили
+                            await database.ref(`rooms/${roomCode}/game`).update({ phase: 'GAME_OVER', winner: 'civilians', ejected: candidate });
+                        } else {
+                            // Ещё есть живые шпионы - игра продолжается
+                            await database.ref(`rooms/${roomCode}/game`).update({ phase: 'PLAYING', votes: null, lastEjected: { name: players.find(p=>p.id===candidate)?.name, role: 'impostor' } });
+                        }
                     } else {
                         await database.ref(`rooms/${roomCode}/game/players/${candidate}`).update({ isDead: true });
-                        const aliveNow = Object.values(gamePlayers).filter(p => !p.isDead).length - 1; 
-                        if (aliveNow <= 2) await database.ref(`rooms/${roomCode}/game`).update({ phase: 'GAME_OVER', winner: 'impostor', ejected: candidate });
-                        else await database.ref(`rooms/${roomCode}/game`).update({ phase: 'PLAYING', votes: null, lastEjected: { name: players.find(p=>p.id===candidate)?.name, role: 'civilian' } });
+                        
+                        // Считаем живых мирных и шпионов
+                        const updatedPlayers = { ...gamePlayers, [candidate]: { ...gamePlayers[candidate], isDead: true } };
+                        const aliveCivilians = Object.values(updatedPlayers).filter(p => p.role === 'civilian' && !p.isDead).length;
+                        const aliveImpostors = Object.values(updatedPlayers).filter(p => p.role === 'impostor' && !p.isDead).length;
+                        
+                        // Шпионы побеждают если их >= мирных
+                        if (aliveImpostors >= aliveCivilians) {
+                            await database.ref(`rooms/${roomCode}/game`).update({ phase: 'GAME_OVER', winner: 'impostor', ejected: candidate });
+                        } else {
+                            await database.ref(`rooms/${roomCode}/game`).update({ phase: 'PLAYING', votes: null, lastEjected: { name: players.find(p=>p.id===candidate)?.name, role: 'civilian' } });
+                        }
                     }
                 } else {
                     await database.ref(`rooms/${roomCode}/game`).update({ phase: 'PLAYING', votes: null });
@@ -673,13 +713,25 @@
                             {isHost ? (
                                 <div className="fixed bottom-6 left-6 right-6 space-y-3 bg-gray-900 pt-2 pb-6 border-t border-gray-800">
                                     <div className="flex gap-2 mb-2">
-                                        <select value={selectedTheme} onChange={e => setSelectedTheme(e.target.value)} className="w-2/3 bg-gray-800 text-white p-4 rounded-xl outline-none border border-gray-700 text-lg">
+                                        <select value={selectedTheme} onChange={e => setSelectedTheme(e.target.value)} className="flex-1 bg-gray-800 text-white p-4 rounded-xl outline-none border border-gray-700 text-base">
                                             {Object.keys(GAME_DATABASE).map(t => <option key={t} value={t}>{t}</option>)}
                                         </select>
-                                        <select value={difficulty} onChange={e => setDifficulty(e.target.value)} className="w-1/3 bg-gray-800 text-white p-4 rounded-xl outline-none border border-gray-700 text-lg">
+                                    </div>
+                                    <div className="flex gap-2 mb-2">
+                                        <select value={difficulty} onChange={e => setDifficulty(e.target.value)} className="flex-1 bg-gray-800 text-white p-4 rounded-xl outline-none border border-gray-700 text-base">
                                             <option value="easy">🟢 Изи</option><option value="medium">🟡 Норм</option><option value="hard">🔴 Жесть</option><option value="mix">🎲 Микс</option>
                                         </select>
+                                        <select value={spyCount} onChange={e => setSpyCount(Number(e.target.value))} className="w-1/3 bg-gray-800 text-white p-4 rounded-xl outline-none border border-gray-700 text-base">
+                                            <option value={1}>🕵️ 1 шпион</option>
+                                            <option value={2}>🕵️🕵️ 2 шпиона</option>
+                                            {players.length >= 8 && <option value={3}>🕵️🕵️🕵️ 3 шпиона</option>}
+                                        </select>
                                     </div>
+                                    {spyCount > 1 && (
+                                        <div className="text-center text-yellow-400 text-sm mb-2 bg-yellow-400/10 py-2 rounded-lg">
+                                            ⚠️ Режим {spyCount} шпионов! Шпионы знают друг друга.
+                                        </div>
+                                    )}
                                     <button onClick={startGameSetup} className="w-full bg-green-500 hover:bg-green-600 text-white font-bold py-4 rounded-xl tap-animation">Начать игру</button>
                                 </div>
                             ) : <div className="text-center text-gray-500 mt-10 animate-pulse">Ожидание хоста...</div>}
@@ -696,7 +748,22 @@
                             </div>
                             <div className="flex-1 flex flex-col justify-center items-center text-center">
                                 <div className="mb-2 text-gray-400">Ваша роль:</div>
-                                {myRole === 'impostor' ? <div className="text-5xl font-black text-red-500 mb-8 animate-pulse">🕵️ ШПИОН</div> : <div className="text-5xl font-black text-blue-400 mb-8">МИРНЫЙ</div>}
+                                {myRole === 'impostor' ? <div className="text-5xl font-black text-red-500 mb-4 animate-pulse">🕵️ ШПИОН</div> : <div className="text-5xl font-black text-blue-400 mb-8">МИРНЫЙ</div>}
+                                
+                                {/* Показываем напарников-шпионов */}
+                                {myRole === 'impostor' && gameState.impostorIds && gameState.impostorIds.length > 1 && (
+                                    <div className="bg-red-900/30 border border-red-500/50 p-3 rounded-xl mb-4 w-full">
+                                        <p className="text-red-400 text-sm mb-2">🤝 Твои напарники-шпионы:</p>
+                                        <div className="flex flex-wrap justify-center gap-2">
+                                            {gameState.impostorIds.filter(id => id !== myPlayerId).map(id => (
+                                                <span key={id} className="bg-red-600/50 text-white px-3 py-1 rounded-full text-sm font-bold">
+                                                    {players.find(p => p.id === id)?.name}
+                                                </span>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+                                
                                 <div className="bg-gray-800 p-8 rounded-3xl w-full shadow-2xl border border-gray-700">
                                     <p className="text-gray-400 mb-2 text-sm uppercase">Секретное слово</p>
                                     {myRole === 'impostor' ? <div className="text-3xl font-bold text-gray-500 blur-sm select-none">СКРЫТО</div> : <div className="text-4xl font-bold text-white break-words">{gameState.currentWord}</div>}
@@ -796,7 +863,7 @@
                                 </div>
                                 
                                 <h1 className={`text-4xl md:text-5xl font-black text-white mb-4 uppercase text-center ${gameState.winner === 'civilians' ? 'victory-title' : 'victory-title-impostor'}`}>
-                                    {gameState.winner === 'civilians' ? '🎉 Мирные победили! 🎉' : '💀 Шпион победил! 💀'}
+                                    {gameState.winner === 'civilians' ? '🎉 Мирные победили! 🎉' : (gameState.spyCount > 1 ? '💀 Шпионы победили! 💀' : '💀 Шпион победил! 💀')}
                                 </h1>
                                 
                                 {gameState.endReason === 'spy_guessed' && (
@@ -812,8 +879,20 @@
                                 
                                 <div className={`glow-box bg-black/40 p-6 rounded-2xl mb-8 w-full max-w-sm backdrop-blur-md border-2 ${gameState.winner === 'civilians' ? 'border-blue-400/50 text-blue-400' : 'border-red-400/50 text-red-400'}`}>
                                     <div className="text-center mb-4">
-                                        <p className="text-white/60 text-sm uppercase tracking-wider mb-1">Шпионом был</p>
-                                        <p className="text-3xl font-black text-white">{players.find(p => p.id === gameState.impostorId)?.name || 'Неизвестно'}</p>
+                                        <p className="text-white/60 text-sm uppercase tracking-wider mb-1">
+                                            {gameState.impostorIds && gameState.impostorIds.length > 1 ? 'Шпионами были' : 'Шпионом был'}
+                                        </p>
+                                        {gameState.impostorIds && gameState.impostorIds.length > 1 ? (
+                                            <div className="flex flex-wrap justify-center gap-2 mt-2">
+                                                {gameState.impostorIds.map(id => (
+                                                    <span key={id} className="text-xl font-black text-white bg-red-600/50 px-3 py-1 rounded-full">
+                                                        {players.find(p => p.id === id)?.name || '?'}
+                                                    </span>
+                                                ))}
+                                            </div>
+                                        ) : (
+                                            <p className="text-3xl font-black text-white">{players.find(p => p.id === gameState.impostorId)?.name || 'Неизвестно'}</p>
+                                        )}
                                     </div>
                                     <div className="h-px bg-white/20 w-full mb-4"></div>
                                     <div className="text-center mb-4">
